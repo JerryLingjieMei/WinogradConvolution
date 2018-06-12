@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="8cbbf06c-c58a-47fe-9e3b-c50b0c5bc32a" name="cyclops (project level)" url="http://cyclops.juliacomputing.io">
+        <fileTransfer host="cyclops.juliacomputing.io" port="22" privateKey="$USER_HOME$/.ssh/id_rsa" rootFolder="/home/jerrylingjiemei" accessType="SFTP" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" />
+          </advancedOptions>
+          <option name="port" value="22" />
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

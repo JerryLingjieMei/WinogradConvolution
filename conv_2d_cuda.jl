@@ -8,13 +8,11 @@ mutable struct conv2dWinograd{T}
     img::AbstractArray{T,4}
     dest::AbstractArray{T,4}
     function conv2dWinograd(fil::AbstractArray{T,4}, img::AbstractArray{T,4}) where T
-        fil_c, fil_w, fil_h, fil_k=size(fil)
-        img_c, img_w, img_h, img_n =size(img)
+        fil_k, fil_w, fil_h, fil_c=size(fil)
+        img_n, img_w, img_h, img_c =size(img)
         @assert img_c == fil_c
-        fil_trans=similar(img,fil_c,4,4,fil_k)
-        tile_h=cld(img_h,2)
-        tile_w=cld(img_w,2)
-        dest=similar(img,fil_k,img_w,img_h ,img_n)
+        fil_trans=similar(img,fil_k,4,4,fil_c)
+        dest=similar(img,img_n,img_w,img_h ,fil_k)
         return new{T}(fil,fil_trans,img,dest)
     end
 end
@@ -28,7 +26,7 @@ end
     fil_ck=zeros(MMatrix{4,4,T})
     for i in 1:3
         for j in 1:3
-            fil_ck[j,i]=fil[c,j,i,k]
+            fil_ck[j,i]=fil[k,j,i,c]
         end
     end
     mid = zeros(MMatrix{4,3,T})
@@ -46,7 +44,7 @@ end
     end
     for i in 1 % UInt32:4 % UInt32
         for j in 1 % UInt32:4 % UInt32
-            fil_trans[c,j,i,k]=fil_ck[j,i]
+            fil_trans[k,j,i,c]=fil_ck[j,i]
         end
     end
     return
@@ -54,169 +52,209 @@ end
 
 function forward(layer::conv2dWinograd, img::AbstractArray{T,4}) where T
     layer.img=img
-    img_c,img_w,img_h,img_n=size(img)
-    fil_c,fil_w,fil_h,fil_k=size(layer.fil)
+    img_n,img_w,img_h,img_c=size(img)
+    fil_k,fil_w,fil_h,fil_c=size(layer.fil)
     @cuda blocks=(cld(fil_c,32),fil_k) threads =32 fil_trans_kernel(layer.fil,layer.fil_trans,fil_c)
     synchronize()
-    @cuda blocks=(fld(img_w,6) * fld(img_h,6),fil_k,img_n) threads=(32,4,4) shmem=sizeof(T)*32*(8*8+4*4) img_trans_kernel(layer.img,layer.fil_trans,layer.dest,(fld(img_w,6),fld(img_h,6)),(img_w,img_h),img_c)
+    @cuda blocks=(cld(img_w,8) * cld(img_h,8),cld(img_n,32),fil_k) threads=(32,4,4) shmem=sizeof(T) * (32 * (10 * 10) + 4 * 4) img_trans_kernel(layer.img,layer.fil_trans,layer.dest,img_w,img_h,img_c)
 end
+#
+# function forward_new(layer::conv2dWinograd, img::AbstractArray{T,4}) where T
+#     layer.img=img
+#     img_c,img_w,img_h,img_n=size(img)
+#     fil_c,fil_w,fil_h,fil_k=size(layer.fil)
+#     @cuda blocks=(cld(fil_c,32),fil_k) threads =32 fil_trans_kernel(layer.fil,layer.fil_trans,fil_c)
+#     synchronize()
+#     @cuda blocks=(fld(img_w,8) * fld(img_h,8),fil_k,img_n) threads=(32,4,4) shmem=sizeof(T) * 32 * (12 * 12 + 4 * 4) img_trans_kernel(layer.img,layer.fil_trans,layer.dest,(fld(img_w,12),fld(img_h,12)),(img_w,img_h),img_c)
+# end
 
-@inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, superTile_sz, img_sz, channels) where T
-    superTile_h,superTile_w=superTile_sz
-    img_h,img_w=img_sz
-    n=blockIdx().z
-    k=blockIdx().y
-    sTile_id_h= div(blockIdx().x - 1,superTile_w) + 1
-    sTile_id_w= rem(blockIdx().x - 1,superTile_w) + 1
-    tile_id_h=threadIdx().z
-    tile_id_w=threadIdx().y
-    c=threadIdx().x
-    img_n_shared = @cuStaticSharedMem(T, (32, 8, 8))
-    fil_k_shared = @cuStaticSharedMem(T, (32, 4, 4))
+# @inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, superTile_sz::NTuple{2,Int}, img_sz::NTuple{2,Int}, channels::Int) where T
+#     temp=zeros(MMatrix{4,4,T})
+#     csum=zeros(MMatrix{2,2,T})
+#     mid=zeros(MMatrix{4,4,T})
+#     superTile_h,superTile_w=superTile_sz
+#     img_h,img_w=img_sz
+#     n=blockIdx().z
+#     k=blockIdx().y
+#     z=threadIdx().z
+#     y=threadIdx().y
+#     tile_id_h=2 * (threadIdx().z - 1)
+#     tile_id_w=2 * (threadIdx().y - 1)
+#     sTile_id_h= 6 * div(blockIdx().x - 1,superTile_w) + tile_id_h
+#     sTile_id_w= 6 * rem(blockIdx().x - 1,superTile_w) + tile_id_w
+#     c=threadIdx().x
+#     img_n_shared = @cuStaticSharedMem(T, (32, 8, 8))
+#     fil_k_shared = @cuStaticSharedMem(T, (32, 4, 4))
+#     for ch in c:32:channels
+#         for i in 1:2, j in 1:2
+#             x_h=sTile_id_h + i - 1
+#             x_w=sTile_id_w + j - 1
+#             if 0 < x_w <= img_w && 0 < x_h <= img_h
+#                 img_n_shared[c,tile_id_w + j,tile_id_h + i]=img[ch,x_w,x_h,n]
+#             else
+#                 img_n_shared[c,tile_id_w + j,tile_id_h + i]=zero(T)
+#             end
+#         end
+#         fil_k_shared[c,z,y]=fil_trans[ch,z,y]
+#         sync_threads()
+#         if y < 4 && z < 4
+#             for i in 1:4, j in 1:4
+#                 temp[j,i]=img_n_shared[c,tile_id_w + j,tile_id_h + i]
+#             end
+#             for i in 1:4
+#                 mid[1,i]= temp[1,i] - temp[3,i]
+#                 mid[2,i]= temp[2,i] + temp[3,i]
+#                 mid[3,i]= temp[3,i] - temp[2,i]
+#                 mid[4,i]= temp[2,i] - temp[4,i]
+#             end
+#             for i in 1:4
+#                 temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k_shared[c,i,1]
+#                 temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k_shared[c,i,2]
+#                 temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k_shared[c,i,3]
+#                 temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k_shared[c,i,4]
+#             end
+#             for i in 1:4
+#                 mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
+#                 mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
+#             end
+#             for i in 1:2
+#                 csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
+#                 csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
+#             end
+#         end
+#     end
+#     sync_threads()
+#     for i in 1:2,j in 1:2
+#         if z < 4 && y < 4
+#             csum[j,i] = csum[j,i] + shfl_down(csum[j,i],16)
+#             csum[j,i] = csum[j,i] + shfl_down(csum[j,i],8)
+#             csum[j,i] = csum[j,i] + shfl_down(csum[j,i],4)
+#             csum[j,i] = csum[j,i] + shfl_down(csum[j,i],2)
+#             csum[j,i] = csum[j,i] + shfl_down(csum[j,i],1)
+#             if c == 1
+#                 x_w= sTile_id_w + j
+#                 x_h= sTile_id_h + i
+#                 if x_w <= img_w && x_h <= img_h
+#                     dest[k,x_w,x_h,n]=csum[j,i]
+#                 end
+#             end
+#         end
+#     end
+#     return
+# end
+
+# @inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, img_w::Int, img_h::Int, channels::Int, filters::Int) where T
+#     tile_x, tile_y=divrem(blockIdx().x - 1, cld(img_w,2))
+#     tile_x += 1
+#     tile_y += 1
+#     n=(blockIdx().y - 1) * blockDim().x + threadIdx().x
+#     k=blockIdx().z
+#     nx=threadIdx().x
+#     fil_k=@cuDynamicSharedMem(T,(4,4,channels))
+#     temp=zeros(MMatrix{4,4,T})
+#     csum=zeros(MMatrix{2,2,T})
+#     mid=zeros(MMatrix{4,4,T})
+#     for c in 1:channels
+#         if nx <= 16
+#             fil_k[nx + (c - 1) * 16]=fil_trans[k + filters * (nx - 1 + (c - 1) * 16)]
+#         end
+#         for i in 1:4, j in 1:4
+#             x_h=2 * tile_x + i - 1
+#             x_w=2 * tile_y + j - 1
+#             if 0 < x_h <= img_h && 0 < x_w <= img_w
+#                 temp[j,i]=img[n,x_w,x_h,c]
+#             else
+#                 temp[j,i]=zero(T)
+#             end
+#         end
+#         for i in 1:4
+#             mid[1,i]= temp[1,i] - temp[3,i]
+#             mid[2,i]= temp[2,i] + temp[3,i]
+#             mid[3,i]= temp[3,i] - temp[2,i]
+#             mid[4,i]= temp[2,i] - temp[4,i]
+#         end
+#         for i in 1:4
+#             temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k[i,1,c]
+#             temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k[i,2,c]
+#             temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k[i,3,c]
+#             temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k[i,4,c]
+#         end
+#         for i in 1:4
+#             mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
+#             mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
+#         end
+#         for i in 1:2
+#             csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
+#             csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
+#         end
+#     end
+#     for i in 1:2,j in 1:2
+#         x_h=2 * tile_x + i
+#         x_w=2 * tile_y + j
+#         if 0 < x_h <= img_h && 0 < x_w <= img_w
+#             dest[n,x_w,x_h,k]=csum[j,i]
+#         end
+#     end
+#     return
+# end
+
+
+@inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, img_w::Int, img_h::Int, channels::Int) where T
+    n=(blockIdx().y - 1) * blockDim().x + threadIdx().x
+    k=blockIdx().z
+    z=threadIdx().z
+    y=threadIdx().y
+    t_h,t_w= divrem(blockIdx().x - 1,cld(img_w,8))
+    img_n= @cuStaticSharedMem(T, (32,10, 10))
+    fil_k = @cuStaticSharedMem(T, (4, 4))
     csum=zeros(MMatrix{2,2,T})
-    for ch in c:32:channels
-        for i in 1:2
-			for j in 1:2
-				h=2 * (tile_id_h - 1) + i
-				x_h=6 * (sTile_id_h - 1) + h - 1
-				w=2 * (tile_id_w - 1) + j
-				x_w=6 * (sTile_id_w - 1) + w - 1
-				if 0 < x_w <= img_w && 0< x_h<=img_h
-					img_n_shared[c,w,h]=img[ch,x_w,x_h,n]
+    temp=zeros(MMatrix{4,4,T})
+    mid=zeros(MMatrix{4,4,T})
+    for c in 1:channels
+        for i in 0:4:8, j in 0:4:8
+            if z + j <= 10 &&y + i <= 10
+				x_h=8 * t_h + y - 1 + i
+				x_w=8 * t_w + z - 1 + j
+				if 0 < x_w <= img_w && 0 < x_h <= img_h
+					img_n[(threadIdx().x),z + j,y + i]=img[n,x_w,x_h,c]
 				else
-					img_n_shared[c,w,h]=zero(T)
+					img_n[(threadIdx().x),z + j,y + i]=zero(T)
 				end
-            end
+			end
         end
-        fil_k_shared[c,tile_id_w,tile_id_h]=fil_trans[ch,tile_id_w,tile_id_h,k]
+        if threadIdx().x == 1
+            fil_k[z,y]=fil_trans[k,z,y,c]
+        end
         sync_threads()
-        if tile_id_h < 4 && tile_id_w < 4
-            temp=zeros(MMatrix{4,4,T})
-            for i in 1:4
-                for j in 1:4
-                    temp[j,i]=img_n_shared[c,2 * (tile_id_w - 1) + j,2 * (tile_id_h - 1) + i ]
-                end
-            end
-            mid=zeros(MMatrix{4,4,T})
-            for i in 1:4
-                mid[1,i]= temp[1,i] - temp[3,i]
-                mid[2,i]= temp[2,i] + temp[3,i]
-                mid[3,i]= temp[3,i] - temp[2,i]
-                mid[4,i]= temp[2,i] - temp[4,i]
-            end
-            for i in 1:4
-                temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k_shared[c,i,1]
-                temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k_shared[c,i,2]
-                temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k_shared[c,i,3]
-                temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k_shared[c,i,4]
-            end
-            for i in 1:4
-                mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
-                mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
-            end
-            for i in 1:2
-                csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
-                csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
-            end
+        for i in 1:4, j in 1:4
+            temp[j,i]=img_n[(threadIdx().x),2 * (threadIdx().z - 1) + j,2 * (threadIdx().y - 1) + i]
         end
-    end
-    sync_threads()
-    for i in 1:2
-        for j in 1:2
-            if tile_id_h < 4 && tile_id_w < 4
-                csum[j,i] += shfl_down(csum[j,i],16)
-                csum[j,i] += shfl_down(csum[j,i],8)
-                csum[j,i] += shfl_down(csum[j,i],4)
-                csum[j,i] += shfl_down(csum[j,i],2)
-                csum[j,i] += shfl_down(csum[j,i],1)
-                if c == 1
-                    x_w= 6 * (sTile_id_w - 1) + 2 * (tile_id_w - 1) + j
-                    x_h= 6 * (sTile_id_h - 1) + 2 * (tile_id_h - 1) + i
-                    if x_w <= img_w && x_h <= img_h
-                        dest[k,x_w,x_h,n]=csum[j,i]
-                    end
-                end
-            end
+        for i in 1:4
+            mid[1,i]= temp[1,i] - temp[3,i]
+            mid[2,i]= temp[2,i] + temp[3,i]
+            mid[3,i]= temp[3,i] - temp[2,i]
+            mid[4,i]= temp[2,i] - temp[4,i]
         end
-    end
-    return
-end
-@inbounds function img_trans_kernel_new(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, superTile_sz, img_sz, channels) where T
-    superTile_h,superTile_w=superTile_sz
-    img_h,img_w=img_sz
-    n=blockIdx().z
-    k=blockIdx().y
-    sTile_id_h= div(blockIdx().x - 1,superTile_w) + 1
-    sTile_id_w= rem(blockIdx().x - 1,superTile_w) + 1
-    tile_id_h=threadIdx().z
-    tile_id_w=threadIdx().y
-    c=threadIdx().x
-    img_n_shared = @cuStaticSharedMem(T, (32, 10, 10))
-    fil_k_shared = @cuStaticSharedMem(T, (32, 4, 4))
-    csum=zeros(MMatrix{2,2,T})
-    for ch in c:32:channels
+        for i in 1:4
+            temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k[i,1]
+            temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k[i,2]
+            temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k[i,3]
+            temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k[i,4]
+        end
+        for i in 1:4
+            mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
+            mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
+        end
         for i in 1:2
-			for j in 1:2
-				h=2 * (tile_id_h - 1) + i
-				x_h=8 * (sTile_id_h - 1) + h - 1
-				w=2 * (tile_id_w - 1) + j
-				x_w=8 * (sTile_id_w - 1) + w - 1
-				if 0 < x_w <= img_w && 0< x_h<=img_h
-					img_n_shared[c,w,h]=img[ch,x_w,x_h,n]
-				else
-					img_n_shared[c,w,h]=zero(T)
-				end
-            end
-        end
-        fil_k_shared[c,tile_id_w,tile_id_h]=fil_trans[ch,tile_id_w,tile_id_h,k]
-        sync_threads()
-        if tile_id_h < 4 && tile_id_w < 4
-            temp=zeros(MMatrix{4,4,T})
-            for i in 1:4
-                for j in 1:4
-                    temp[j,i]=img_n_shared[c,2 * (tile_id_w - 1) + j,2 * (tile_id_h - 1) + i ]
-                end
-            end
-            mid=zeros(MMatrix{4,4,T})
-            for i in 1:4
-                mid[1,i]= temp[1,i] - temp[3,i]
-                mid[2,i]= temp[2,i] + temp[3,i]
-                mid[3,i]= temp[3,i] - temp[2,i]
-                mid[4,i]= temp[2,i] - temp[4,i]
-            end
-            for i in 1:4
-                temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k_shared[c,i,1]
-                temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k_shared[c,i,2]
-                temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k_shared[c,i,3]
-                temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k_shared[c,i,4]
-            end
-            for i in 1:4
-                mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
-                mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
-            end
-            for i in 1:2
-                csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
-                csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
-            end
+            csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
+            csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
         end
     end
-    sync_threads()
-    for i in 1:2
-        for j in 1:2
-            if tile_id_h < 4 && tile_id_w < 4
-                csum[j,i] += shfl_down(csum[j,i],16)
-                csum[j,i] += shfl_down(csum[j,i],8)
-                csum[j,i] += shfl_down(csum[j,i],4)
-                csum[j,i] += shfl_down(csum[j,i],2)
-                csum[j,i] += shfl_down(csum[j,i],1)
-                if c == 1
-                    x_w= 6 * (sTile_id_w - 1) + 2 * (tile_id_w - 1) + j
-                    x_h= 6 * (sTile_id_h - 1) + 2 * (tile_id_h - 1) + i
-                    if x_w <= img_w && x_h <= img_h
-                        dest[k,x_w,x_h,n]=csum[j,i]
-                    end
-                end
-            end
+    for i in 1:2,j in 1:2
+        x_w= 8 * t_w + 2 * (threadIdx().z - 1) + j
+        x_h= 8 * t_h + 2 * (threadIdx().y - 1) + i
+        if x_w <= img_w && x_h <= img_h
+            dest[n,x_w,x_h,k]=csum[j,i]
         end
     end
     return

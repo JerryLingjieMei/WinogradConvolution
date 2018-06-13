@@ -8,7 +8,6 @@ using CUDAdrv
 using CUDAnative
 import NVTX
 
-device!(4)
 NVTX.stop() # Use `--profile-from-start=off`
 ITERATIONS = 2
 

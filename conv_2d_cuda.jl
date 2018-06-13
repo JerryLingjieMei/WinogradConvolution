@@ -56,7 +56,7 @@ function forward(layer::conv2dWinograd, img::AbstractArray{T,4}) where T
     fil_k,fil_w,fil_h,fil_c=size(layer.fil)
     @cuda blocks=(cld(fil_c,32),fil_k) threads =32 fil_trans_kernel(layer.fil,layer.fil_trans,fil_c)
     synchronize()
-    @cuda blocks=(cld(img_w,8) * cld(img_h,8),cld(img_n,32),fil_k) threads=(32,4,4) shmem=sizeof(T) * (32 * (10 * 10) + 4 * 4) img_trans_kernel(layer.img,layer.fil_trans,layer.dest,img_w,img_h,img_c)
+    @cuda blocks=(cld(img_w,8) * cld(img_h,8),cld(img_n,32),fil_k) threads=(32,4,4) shmem=sizeof(T) * (32 * (10 * 10) + 4 * 4)  img_trans_kernel(layer.img,layer.fil_trans,layer.dest,img_w,img_h,img_c)
 end
 #
 # function forward_new(layer::conv2dWinograd, img::AbstractArray{T,4}) where T
@@ -200,10 +200,11 @@ end
 
 
 @inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, img_w::Int, img_h::Int, channels::Int) where T
-    n=(blockIdx().y - 1) * blockDim().x + threadIdx().x
-    k=blockIdx().z
-    z=threadIdx().z
-    y=threadIdx().y
+    n=(blockIdx().y - 1) * blockDim().x + threadIdx().x - 1
+    nn=threadIdx().x - 1
+    k=blockIdx().z - 1
+    z=threadIdx().z - 1
+    y=threadIdx().y - 1
     t_h,t_w= divrem(blockIdx().x - 1,cld(img_w,8))
     img_n= @cuStaticSharedMem(T, (32,10, 10))
     fil_k = @cuStaticSharedMem(T, (4, 4))
@@ -212,22 +213,22 @@ end
     mid=zeros(MMatrix{4,4,T})
     for c in 1:channels
         for i in 0:4:8, j in 0:4:8
-            if z + j <= 10 &&y + i <= 10
-				x_h=8 * t_h + y - 1 + i
-				x_w=8 * t_w + z - 1 + j
-				if 0 < x_w <= img_w && 0 < x_h <= img_h
-					img_n[(threadIdx().x),z + j,y + i]=img[n,x_w,x_h,c]
-				else
-					img_n[(threadIdx().x),z + j,y + i]=zero(T)
-				end
-			end
-        end
-        if threadIdx().x == 1
-            fil_k[z,y]=fil_trans[k,z,y,c]
+            if z + j < 10 &&y + i < 10
+                x_h=8 * t_h + y - 1 + i
+                x_w=8 * t_w + z - 1 + j
+                if 0 < x_w <= img_w && 0 < x_h <= img_h
+                    img_n[nn + 1,z + j + 1,y + i + 1]=img[n + 1,x_w,x_h,c]
+                else
+                    img_n[nn + 1,z + j + 1,y + i + 1]=zero(T)
+                end
+            end
         end
         sync_threads()
+        if threadIdx().x == 1
+            fil_k[z + 1,y + 1]=fil_trans[k + 1,z + 1,y + 1,c]
+        end
         for i in 1:4, j in 1:4
-            temp[j,i]=img_n[(threadIdx().x),2 * (threadIdx().z - 1) + j,2 * (threadIdx().y - 1) + i]
+            temp[j,i]=img_n[nn + 1,2 * z + j,2 * y + i]
         end
         for i in 1:4
             mid[1,i]= temp[1,i] - temp[3,i]
@@ -235,6 +236,7 @@ end
             mid[3,i]= temp[3,i] - temp[2,i]
             mid[4,i]= temp[2,i] - temp[4,i]
         end
+        sync_threads()
         for i in 1:4
             temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k[i,1]
             temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k[i,2]
@@ -251,10 +253,10 @@ end
         end
     end
     for i in 1:2,j in 1:2
-        x_w= 8 * t_w + 2 * (threadIdx().z - 1) + j
-        x_h= 8 * t_h + 2 * (threadIdx().y - 1) + i
+        x_w= 8 * t_w + 2 * z + j
+        x_h= 8 * t_h + 2 * y + i
         if x_w <= img_w && x_h <= img_h
-            dest[n,x_w,x_h,k]=csum[j,i]
+            dest[n + 1,x_w,x_h,k + 1]=csum[j,i]
         end
     end
     return

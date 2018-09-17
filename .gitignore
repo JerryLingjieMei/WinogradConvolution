@@ -92,3 +92,4 @@ fabric.properties
 *.iml
 out
 gen
+.idea/

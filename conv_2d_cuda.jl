@@ -199,64 +199,61 @@ end
 # end
 
 
-@inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, img_w::Int, img_h::Int, channels::Int) where T
-    n=(blockIdx().y - 1) * blockDim().x + threadIdx().x - 1
+@inbounds function img_trans_kernel(img::AbstractArray{T,4}, fil_trans::AbstractArray{T,4}, dest::AbstractArray{T,4}, stride_w::Int) where T
+    _, img_w, img_h, _ =size(img)
+    channels =size(fil_trans,4)
+    n=(blockIdx().x - 1) * blockDim().x + threadIdx().x - 1
     nn=threadIdx().x - 1
     k=blockIdx().z - 1
     z=threadIdx().z - 1
     y=threadIdx().y - 1
-    t_h,t_w= divrem(blockIdx().x - 1,cld(img_w,8))
-    img_n= @cuStaticSharedMem(T, (32,10, 10))
-    fil_k = @cuStaticSharedMem(T, (4, 4))
+    t_h,t_w= divrem(blockIdx().y - 1,stride_w)
+    img_n= @cuStaticSharedMem(T, (32,12,12))
+    fil_k = @cuStaticSharedMem(T,(4,4))
     csum=zeros(MMatrix{2,2,T})
-    temp=zeros(MMatrix{4,4,T})
-    mid=zeros(MMatrix{4,4,T})
-    for c in 1:channels
-        for i in 0:4:8, j in 0:4:8
-            if z + j < 10 &&y + i < 10
-                x_h=8 * t_h + y - 1 + i
-                x_w=8 * t_w + z - 1 + j
-                if 0 < x_w <= img_w && 0 < x_h <= img_h
-                    img_n[nn + 1,z + j + 1,y + i + 1]=img[n + 1,x_w,x_h,c]
-                else
-                    img_n[nn + 1,z + j + 1,y + i + 1]=zero(T)
-                end
-            end
+    temp1=zeros(MMatrix{4,4,T})
+    temp2=zeros(MMatrix{4,4,T})
+    temp3=zeros(MMatrix{4,4,T})
+    temp4=zeros(MMatrix{2,4,T})
+    for c in 0:channels - 1
+        for i in 0:2, j in 0:2
+            x_h=8 * t_h + 3 * y + i - 1
+            x_w=8 * t_w + 3 * z + j - 1
+            img_n[nn + 1, 3 * z + j + 1 ,3 * y + i + 1]= 0 <= x_h < img_h && 0 <= x_w < img_w ? img[n + 1,x_w + 1,x_h + 1,c + 1] : zero(T)
+        end
+        if threadIdx().x - 1 == 0
+            fil_k[z + 1,y + 1]=fil_trans[k + 1,z + 1,y + 1,c + 1]
         end
         sync_threads()
-        if threadIdx().x == 1
-            fil_k[z + 1,y + 1]=fil_trans[k + 1,z + 1,y + 1,c]
-        end
         for i in 1:4, j in 1:4
-            temp[j,i]=img_n[nn + 1,2 * z + j,2 * y + i]
+            temp1[j,i]=img_n[nn + 1,2 * z + j,2 * y + i]
         end
         for i in 1:4
-            mid[1,i]= temp[1,i] - temp[3,i]
-            mid[2,i]= temp[2,i] + temp[3,i]
-            mid[3,i]= temp[3,i] - temp[2,i]
-            mid[4,i]= temp[2,i] - temp[4,i]
-        end
-        sync_threads()
-        for i in 1:4
-            temp[i,1]=(mid[i,1] - mid[i,3]) * fil_k[i,1]
-            temp[i,2]=(mid[i,2] + mid[i,3]) * fil_k[i,2]
-            temp[i,3]=(mid[i,3] - mid[i,2]) * fil_k[i,3]
-            temp[i,4]=(mid[i,2] - mid[i,4]) * fil_k[i,4]
+            temp2[1,i]= temp1[1,i] - temp1[3,i]
+            temp2[2,i]= temp1[2,i] + temp1[3,i]
+            temp2[3,i]= temp1[3,i] - temp1[2,i]
+            temp2[4,i]= temp1[2,i] - temp1[4,i]
         end
         for i in 1:4
-            mid[1,i]= temp[1,i] + temp[2,i] + temp[3,i]
-            mid[2,i]= temp[2,i] - temp[3,i] - temp[4,i]
+            temp3[i,1]=(temp2[i,1] - temp2[i,3]) * fil_k[i,1]
+            temp3[i,2]=(temp2[i,2] + temp2[i,3]) * fil_k[i,2]
+            temp3[i,3]=(temp2[i,3] - temp2[i,2]) * fil_k[i,3]
+            temp3[i,4]=(temp2[i,2] - temp2[i,4]) * fil_k[i,4]
+        end
+        for i in 1:4
+            temp4[1,i]= temp3[1,i] + temp3[2,i] + temp3[3,i]
+            temp4[2,i]= temp3[2,i] - temp3[3,i] - temp3[4,i]
         end
         for i in 1:2
-            csum[i,1] += mid[i,1] + mid[i,2] + mid[i,3]
-            csum[i,2] += mid[i,2] - mid[i,3] - mid[i,4]
+            csum[i,1] += temp4[i,1] + temp4[i,2] + temp4[i,3]
+            csum[i,2] += temp4[i,2] - temp4[i,3] - temp4[i,4]
         end
     end
-    for i in 1:2,j in 1:2
-        x_w= 8 * t_w + 2 * z + j
-        x_h= 8 * t_h + 2 * y + i
-        if x_w <= img_w && x_h <= img_h
-            dest[n + 1,x_w,x_h,k + 1]=csum[j,i]
+    for i in 0:1,j in 0:1
+        x_w=8 * t_w + 2 * z + j
+        x_h=8 * t_h + 2 * y + i
+        if x_w < img_w && x_h < img_h
+            dest[n + 1,x_w + 1,x_h + 1,k + 1]=csum[j,i]
         end
     end
     return
